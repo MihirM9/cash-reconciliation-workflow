@@ -1,0 +1,25 @@
+{
+  "name": "sec-workflow-demo",
+  "private": true,
+  "version": "0.1.0",
+  "description": "SEC-aware cash-reconciliation workflow with AI suggestion + human decision + append-only audit log.",
+  "workspaces": [
+    "shared",
+    "backend",
+    "frontend"
+  ],
+  "scripts": {
+    "dev": "npm-run-all --parallel dev:backend dev:frontend",
+    "dev:backend": "npm run dev --workspace backend",
+    "dev:frontend": "npm run dev --workspace frontend",
+    "build": "npm run build --workspaces --if-present",
+    "seed": "npm run seed --workspace backend",
+    "export": "npm run export --workspace backend --",
+    "design:lint": "npx --yes @google/design.md lint DESIGN.md",
+    "design:export": "npx --yes @google/design.md export --format dtcg DESIGN.md > tokens.json"
+  },
+  "devDependencies": {
+    "npm-run-all": "^4.1.5",
+    "typescript": "^5.6.3"
+  }
+}

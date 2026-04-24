@@ -1,176 +1,296 @@
-# SEC-Aware Cash Reconciliation Workflow (demo)
+# Cash Reconciliation Workflow
 
-A narrow, walkthrough-ready demo of an **AI-assisted, SEC-aware** workflow for a
-private fund adviser. It focuses on a single case type — daily cash reconciliation —
-and demonstrates how AI can suggest, humans can decide, and every step can be
-reconstructed from an append-only audit log consistent with the spirit of SEC
-Rule 204-2 recordkeeping expectations.
+A narrow, production-shaped demo of how an investment adviser can use AI inside
+its operations **without** losing the audit trail, the human-in-the-loop, or
+the books-and-records posture that the SEC expects under Rule 204-2.
 
-The UI is intentionally minimal and component-based so a **Google Stitch**
-design-system drop can replace the styling without touching data flow.
+It implements one case type end-to-end — daily cash reconciliation between a
+fund's bank balance and its ledger balance — and stops. The point isn't the
+reconciliation logic. The point is the *workflow shell around the AI*:
 
-## Why each piece exists
+- AI suggests, never decides.
+- Humans decide behind a role gate, and say why on the record.
+- Every state change and every AI call writes an immutable audit row in the
+  same transaction.
+- The record is filterable, exportable, and easy to hand to an examiner.
 
-- **AI is advisory, human is authoritative.** `POST /cases/:id/ai-suggestion` writes
-  only to `Case.aiSuggestion` — it is structurally incapable of changing `Case.status`.
-  `POST /cases/:id/reviewer-decision` is the only path that finalizes, and it is gated
-  behind `requireRole("OPS", "CCO")`.
-- **Append-only audit log.** The `AuditLog` table has no update or delete routes.
-  Every state-changing service call writes state and audit rows in one Prisma
-  transaction, so the log can never drift from the records it describes.
-- **Reconstructable AI calls.** Every AI suggestion records `modelName` + `runId` +
-  a snapshot of `rulesConfig` in the audit details, so an examiner can answer
-  *"which model, with which rules, generated this suggestion?"*.
-- **SLA is part of the record.** `dueAt` is computed at case creation from
-  `CaseType.slaConfig`; a dedicated `SLA_BREACH_RECORDED` audit entry is written
-  when a reviewer decides after the due time.
-- **Exportable books and records.** `GET /export/cases.csv` and `GET /export/audit-logs.csv`,
-  plus a CLI (`npm run export`), both use the same formatter and produce an
-  examiner/LP-ready CSV pair for any date range.
+---
 
-## Repository layout
+## Table of contents
+
+- [Why this exists](#why-this-exists)
+- [Architecture at a glance](#architecture-at-a-glance)
+- [How the controls are wired in code](#how-the-controls-are-wired-in-code)
+- [Quickstart (no API key required)](#quickstart-no-api-key-required)
+- [Walkthrough: five-minute demo](#walkthrough-five-minute-demo)
+- [API reference](#api-reference)
+- [Data model](#data-model)
+- [Design system: DESIGN.md](#design-system-designmd)
+- [Regulatory framing](#regulatory-framing)
+- [What this deliberately is not](#what-this-deliberately-is-not)
+- [Where this would go next](#where-this-would-go-next)
+
+---
+
+## Why this exists
+
+A lean private-fund adviser today faces two pressures that point in opposite
+directions:
+
+1. **Do more with less.** AI and agents can collapse hours of daily ops work —
+   cash recs, subscription/redemption checks, allocation reviews — into
+   minutes.
+2. **Be exam-ready on day one.** As an RIA, you're on the hook for Rule 204-2
+   books and records, written policies and procedures, and a documented AI
+   governance story that an SEC examiner or LP due-diligence questionnaire
+   will actually probe.
+
+The naive move is to let an LLM "do the rec" and keep the email chain as
+evidence. That fails both dimensions: it isn't faster over the long run, and
+it produces a compliance artifact nobody wants to defend.
+
+This project is the alternative: **treat every run of a workflow as a Case,
+surround the AI with structured controls, and make the audit trail the
+product.** It's deliberately small so the controls aren't hidden.
+
+## Architecture at a glance
 
 ```text
-sec-workflow-demo/
-  backend/        # Express + Prisma + SQLite + OpenAI
-  frontend/       # Vite + React + TS + React Query
-  shared/         # types + Zod schemas shared between backend and frontend
+┌──────────────────────────┐        ┌──────────────────────────┐
+│  Vite + React frontend   │        │  Express + Prisma API    │
+│  - Case List             │  HTTP  │  - /cases                │
+│  - Case Detail           │  ───▶  │  - /cases/:id/ai-*       │
+│  - Reviewer decision     │        │  - /cases/:id/reviewer-* │
+│  - Audit trail           │        │  - /audit-logs           │
+└──────────────────────────┘        │  - /export/*.csv         │
+                                    └────────────┬─────────────┘
+                                                 │
+                                    ┌────────────┴─────────────┐
+                                    │  Case / AuditLog tables  │
+                                    │  append-only writes in   │
+                                    │  a single Prisma tx      │
+                                    └──────────────────────────┘
+
+     AI provider (swappable behind one interface)
+     ├── OpenAiProvider (real LLM, if OPENAI_API_KEY is set)
+     └── RuleBasedProvider (deterministic, no network, no key)
 ```
 
-## Getting started
+**Stack choices, briefly:**
 
-### 1. Install
+| Layer     | Choice                          | Why                                                                                       |
+| --------- | ------------------------------- | ----------------------------------------------------------------------------------------- |
+| Runtime   | Node 20 + TypeScript (ESM)      | Familiar, easy to read, first-class types across boundaries.                              |
+| Backend   | Express + Prisma + SQLite       | Boring, which is the right aesthetic for a compliance demo. SQLite → Postgres is one URL. |
+| Frontend  | Vite + React + TanStack Query   | No SSR needs for an internal tool; the Stitch pipeline drops in cleanly.                  |
+| Contracts | `shared/` package, Zod schemas  | Request/response types live in one place and are validated at both ends.                  |
+| AI        | Typed `AiProvider` interface    | Swap OpenAI ↔ rule-based without touching routes.                                         |
+| Design    | `DESIGN.md` (google-labs-code)  | Tokens + rationale live in source control, not a Figma URL.                               |
+
+## How the controls are wired in code
+
+This table is the tour — every row maps a regulatory concern to the file that
+implements it.
+
+| Concern                                | Where it lives                                                                 |
+| -------------------------------------- | ------------------------------------------------------------------------------ |
+| AI suggests, never decides             | `POST /cases/:id/ai-suggestion` writes **only** to `Case.aiSuggestion` (see `backend/src/routes/cases.ts`, `services/caseService.ts :: attachAiSuggestion`). |
+| Human decision is role-gated           | `POST /cases/:id/reviewer-decision` sits behind `requireRole("OPS", "CCO")` (see `backend/src/middleware/requireRole.ts`). |
+| State + audit are one transaction      | `caseService.ts` wraps every state change in `prisma.$transaction` and calls `writeAudit` inside it (`services/auditService.ts`). |
+| Audit log is append-only               | No update or delete route exists on the `AuditLog` model; `auditService.ts` exposes a write helper only. |
+| AI calls are reproducible              | `modelName`, `runId`, and a snapshot of `rulesConfig` land in the `AI_SUGGESTION_GENERATED` audit entry (`services/caseService.ts :: attachAiSuggestion`). |
+| Policy as data, not code               | `CaseType.rulesConfig` + `slaConfig` are JSON on the case type and are snapshotted into each audit row. |
+| SLA breach is first-class              | `services/slaService.ts` computes `dueAt` at creation; decision time triggers a dedicated `SLA_BREACH_RECORDED` entry. |
+| Examiner / LP export                   | `services/exportService.ts` feeds both `GET /export/*.csv` and the `npm run export` CLI — one formatter, two entry points. |
+
+## Quickstart (no API key required)
+
+The app ships with a deterministic rule-based AI provider. You can run the
+entire demo without an OpenAI key; set one later to switch to a real LLM.
 
 ```bash
+# 1. clone and install
+git clone https://github.com/MihirM9/cash-reconciliation-workflow.git
+cd cash-reconciliation-workflow
 npm install
-```
 
-### 2. Configure environment
-
-```bash
+# 2. env (defaults are fine; leave OPENAI_API_KEY blank to use the rule-based provider)
 cp backend/.env.example backend/.env
-# then edit backend/.env and set OPENAI_API_KEY
-```
 
-`AI_MODEL` defaults to `gpt-4o-mini`. The value is stored on the `CaseType.rulesConfig`
-at seed time so it's part of the compliance record.
-
-### 3. Initialize the database and seed demo data
-
-```bash
+# 3. migrate + seed
 npm run prisma:migrate --workspace backend
 npm run seed
-```
 
-Seed creates:
-
-- 4 users: `Ava Analyst` (ANALYST), `Omar Ops` (OPS), `Casey CCO` (CCO), `Alex Admin` (ADMIN)
-- 1 case type: `CASH_RECONCILIATION` with a $1,000 variance tolerance and 16:00 due time
-- 5 cases spanning `OPEN`, `UNDER_REVIEW`, `APPROVED`, `ESCALATED`, and a SLA-breached `APPROVED`
-
-### 4. Run both apps
-
-```bash
+# 4. run both apps
 npm run dev
 ```
 
-- Backend: [http://localhost:4000](http://localhost:4000)
-- Frontend: [http://localhost:5173](http://localhost:5173) (proxies `/api` -> backend)
+Then open **http://localhost:5173**. The first thing to do is pick a user in
+the top-right **Acting as** dropdown — that controls the `x-user-id` header
+the frontend sends, and therefore what actions you can take.
 
-Pick a user from the "Acting as" dropdown in the top-right. The user's role gates what
-actions are allowed — for example, only OPS and CCO can finalize a reviewer decision.
+To switch to a real LLM later, set `OPENAI_API_KEY` in `backend/.env` and
+restart. On startup the backend logs which provider it chose, and every
+suggestion's `modelName` records it permanently.
 
-### 5. Export books and records
+## Walkthrough: five-minute demo
 
-```bash
-npm run export -- --from 2026-01-01 --to 2026-12-31 --out ./out
-```
+The seed creates five cases that together tell a story an examiner or LP
+would recognize. Walk them in order:
 
-Or hit the HTTP endpoints directly:
+1. **`OPEN`, today** — open the newest case. Point out the four panels:
+   Inputs, AI Suggestion (empty), Reviewer Decision (empty), Audit Trail
+   (one entry: `CASE_CREATED`, with a snapshot of the rules and SLA).
+2. **`UNDER_REVIEW`, yesterday** — AI has already suggested `OK`. The audit
+   trail contains an `AI_SUGGESTION_GENERATED` row with the model name, run
+   ID, and rules snapshot. No finalization yet.
+3. **`APPROVED`, 2 days ago** — full lifecycle: create → AI suggestion → OPS
+   approved. Reviewer decision note is there, decision timestamp is there,
+   status moved from `UNDER_REVIEW` to `APPROVED` in the same transaction
+   that wrote the audit entry.
+4. **`ESCALATED`, 3 days ago** — variance is $11,600 on a $1,000 tolerance,
+   so the AI recommends `ESCALATE`. The CCO confirms and notes an opened
+   ticket with the fund administrator. Escalation is treated as a normal
+   end state, not an exception path.
+5. **`APPROVED` + SLA breached, 4 days ago** — decided at 18:45 local, after
+   the 16:00 due time. The audit trail has two rows for the finalization:
+   `DECISION_MADE` and a separate `SLA_BREACH_RECORDED`. The SLA filter on
+   the Case List surfaces it even though the case is technically approved.
 
-```bash
-curl "http://localhost:4000/export/cases.csv?from=2026-01-01&to=2026-12-31" -o cases.csv
-curl "http://localhost:4000/export/audit-logs.csv?from=2026-01-01&to=2026-12-31" -o audit.csv
-```
+Then:
 
-## Walkthrough script (for a COO / CCO demo)
+- **Switch users** to `Ava Analyst` and open the `OPEN` case. Click
+  **Generate AI suggestion** — watch an `AI_SUGGESTION_GENERATED` row land in
+  the audit trail with a deterministic rule-based explanation (or an LLM one
+  if you configured a key).
+- **Switch users** to `Omar Ops`. The **Submit decision** button enables.
+  Submit with a note; watch `DECISION_MADE` land in the trail in real time.
+- **Export.** Run:
+  ```bash
+  npm run export -- --from 2026-01-01 --to 2026-12-31 --out ./out
+  ```
+  You now have `out/cases.csv` and `out/audit-logs.csv`. Hand those to the
+  imagined examiner and you're done.
 
-1. **Open the Case List.** Point out the SLA filter — breached cases are first-class
-   citizens, not afterthoughts. This is what a CCO wants to see first.
-2. **Open an `OPEN` case.** Walk through the four panels: Inputs, AI Suggestion,
-   Reviewer Decision, Audit Trail. Emphasize that the AI Suggestion panel has its own
-   endpoint and never changes status.
-3. **Click "Generate AI suggestion"** as the analyst. Show the AI response — model
-   name, run ID, generated timestamp, and rationale tied back to the rule set.
-4. **Switch users** to `Omar Ops` in the header. Now the "Submit decision" button
-   enables. Submitting requires a note — confirm in the modal that the note is a
-   permanent record.
-5. **Expand the Audit Trail.** Every entry has actor, action, timestamp, and a raw
-   `details` payload. Show the rules snapshot inside `AI_SUGGESTION_GENERATED` and
-   the `SLA_BREACH_RECORDED` entry on the breached case.
-6. **Run the export CLI.** Hand the resulting `cases.csv` and `audit-logs.csv` to
-   the examiner persona.
+## API reference
 
-## API surface
+Auth is demo-grade: send `x-user-id: <userId>` and the middleware hydrates
+`req.user` from the DB. Swapping to a real IdP is a single file
+(`backend/src/middleware/auth.ts`).
 
 | Method | Path                               | Role             | Purpose                                         |
 | ------ | ---------------------------------- | ---------------- | ----------------------------------------------- |
 | GET    | `/health`                          | —                | Liveness                                        |
-| GET    | `/users`                           | —                | Demo user directory (for the UI switcher)       |
+| GET    | `/users`                           | —                | Demo user directory (powers the UI switcher)    |
 | GET    | `/case-types`                      | —                | List case types                                 |
-| GET    | `/case-types/:id`                  | —                | Show a case type with full rules + SLA config   |
+| GET    | `/case-types/:id`                  | —                | Full case type with rules + SLA config          |
 | POST   | `/case-types`                      | ADMIN / CCO      | Create a case type                              |
-| GET    | `/cases`                           | —                | Filter cases by date / type / status / SLA      |
-| GET    | `/cases/:id`                       | —                | Case detail + full audit log                    |
-| POST   | `/cases`                           | any authed user  | Create case (writes `CASE_CREATED`)             |
+| GET    | `/cases`                           | —                | Filter by date / type / status / SLA            |
+| GET    | `/cases/:id`                       | —                | Case detail with full audit log                 |
+| POST   | `/cases`                           | any authed user  | Create case; writes `CASE_CREATED`              |
 | PATCH  | `/cases/:id/inputs`                | any authed user  | Update inputs pre-finalization                  |
-| POST   | `/cases/:id/ai-suggestion`         | any authed user  | Run AI provider; never finalizes                |
+| POST   | `/cases/:id/ai-suggestion`         | any authed user  | Run AI provider; **never finalizes**            |
 | POST   | `/cases/:id/reviewer-decision`     | OPS / CCO        | Finalize; writes `DECISION_MADE` (+ SLA breach) |
 | GET    | `/audit-logs`                      | —                | Compliance pull by date range                   |
-| GET    | `/export/cases.csv`                | —                | CSV export of cases over a date range           |
-| GET    | `/export/audit-logs.csv`           | —                | CSV export of audit logs over a date range      |
+| GET    | `/export/cases.csv`                | —                | CSV export of cases                             |
+| GET    | `/export/audit-logs.csv`           | —                | CSV export of audit logs                        |
 
-Auth is demo-grade: send `x-user-id: <userId>` and the middleware hydrates
-`req.user` from the DB. Swapping to a real IdP is one file (`backend/src/middleware/auth.ts`).
+All request and response shapes are defined once in
+[`shared/src/schemas.ts`](shared/src/schemas.ts) and [`shared/src/types.ts`](shared/src/types.ts).
 
-## Design system
+## Data model
 
-The canonical visual identity lives in [`DESIGN.md`](DESIGN.md) at the repo root
-— a [google-labs-code/design.md](https://github.com/google-labs-code/design.md)
-spec file. Tokens (colors, typography, rounded, spacing, components) are the
-YAML front matter; the rationale and Do's/Don'ts are the markdown body.
+Four models, no cleverness:
 
-`frontend/src/styles.css` mirrors those tokens 1:1 as CSS custom properties so
-the UI is a direct read of the design system. When you change a token in
-DESIGN.md, update the matching CSS variable until the Stitch exporter is wired
-to regenerate the stylesheet automatically.
+| Model      | Purpose                                                                                 |
+| ---------- | --------------------------------------------------------------------------------------- |
+| `User`     | `ANALYST` / `OPS` / `CCO` / `ADMIN`. The role gate hangs off this.                      |
+| `CaseType` | The workflow definition: `rulesConfig` + `slaConfig` as JSON. Policy as data.           |
+| `Case`     | One run of a workflow. Holds `inputs`, optional `aiSuggestion`, optional `reviewerDecision`, `status`, `dueAt`, `slaBreached`. |
+| `AuditLog` | Append-only. Every state change writes one of: `CASE_CREATED`, `INPUTS_UPDATED`, `AI_SUGGESTION_GENERATED`, `DECISION_MADE`, `SLA_BREACH_RECORDED`. |
 
-Handy commands:
+See [`backend/prisma/schema.prisma`](backend/prisma/schema.prisma). Enums are
+stored as validated strings because SQLite doesn't support native enums; the
+Zod schemas in `shared/` enforce them at the app layer.
+
+## Design system: DESIGN.md
+
+Visual identity lives in [`DESIGN.md`](DESIGN.md) at the repo root, in the
+[google-labs-code/design.md](https://github.com/google-labs-code/design.md)
+format: YAML front-matter tokens + markdown rationale. The design system
+("Ledger") is deliberately tuned for a compliance surface — serif headlines,
+Inter body, JetBrains Mono for identifiers, one disciplined navy accent, and
+a status palette whose foreground/background pairs clear WCAG AA contrast.
+
+[`frontend/src/styles.css`](frontend/src/styles.css) mirrors those tokens 1:1
+as CSS custom properties, so the UI is a direct read of the design system.
 
 ```bash
-npm run design:lint     # validate DESIGN.md (structure + WCAG contrast)
-npm run design:export   # write tokens.json (DTCG) at the repo root
+npm run design:lint     # validate DESIGN.md structure + WCAG contrast
+npm run design:export   # write tokens.json (DTCG format) at the repo root
 ```
 
 See [`frontend/src/design-system/README.md`](frontend/src/design-system/README.md)
-for the DESIGN.md → CSS token mapping and the Stitch component drop-in swap.
+for the token → CSS-variable mapping and the Stitch component drop-in path.
 
-## Compliance narrative (short form)
+## Regulatory framing
 
-- **Rule 204-2 "true, accurate, current":** append-only logs + transactional writes.
-- **AI governance:** separate endpoints for suggestion vs. decision, strict role gating,
-  persisted model + run ID + rules snapshot on every AI invocation.
-- **Policy as data:** rules and SLA live on the `CaseType` and are snapshotted into each
-  audit entry, so historic decisions remain explainable even if policy later changes.
-- **Exceptions are recorded, not hidden:** `SLA_BREACH_RECORDED` is a first-class
-  audit action.
-- **Retrievable and exportable:** filtered list endpoints + CSV export API + CLI.
+This demo isn't legal advice, but the design choices are grounded in what the
+SEC has historically cared about for advisers:
 
-## Development notes
+- **Rule 204-2 "true, accurate, current" books and records.** Append-only
+  audit log, transactional writes that bind state to its audit entry, and a
+  CSV export API + CLI covering the same data for any date range.
+- **Policies and procedures evidence.** The workflow definition (rules, SLA,
+  required inputs, required evidence, escalation criteria, AI model) lives as
+  data on `CaseType` and is snapshotted into each audit row — so a historical
+  decision stays explainable even after the policy is updated.
+- **AI governance, in the shape exam staff and LPs ask about.** Separate
+  endpoints for suggestion vs. decision, a role gate on finalization, and
+  `modelName + runId + rulesSnapshot` preserved on every AI invocation so the
+  question *"which model, with which rules, produced this output?"* has a
+  concrete answer.
+- **Exceptions visible, not buried.** `SLA_BREACH_RECORDED` is a first-class
+  audit action and the Case List has a dedicated SLA filter. Exceptions are
+  what reviewers look at first; the UI reflects that.
 
-- SQLite is used for zero-setup demo. Swap to Postgres by changing `provider` in
-  `backend/prisma/schema.prisma` and `DATABASE_URL` in `backend/.env`.
-- SQLite does not support enums, so status-like columns are stored as strings and
-  validated via Zod schemas in `shared/`.
-- Dates use the server's local timezone; for multi-TZ deployments extend `SlaConfig`
-  with an explicit IANA zone and adjust `computeDueAt` accordingly.
+## What this deliberately is not
+
+- It is **not a reconciliation engine.** The rec itself is two numbers and a
+  variance. The point is the workflow shell, not the math.
+- It is **not a production auth system.** The `x-user-id` header exists so the
+  role gate can be demonstrated without pulling in an IdP. The replacement is
+  a single file.
+- It is **not a real immutability guarantee.** Application-level append-only
+  is the right shape; a real deployment would add database-level controls
+  (row-level triggers, WORM storage, or a tamper-evident log like a
+  certificate-transparency-style Merkle log). The app is structured so adding
+  that later is local.
+- It is **not multi-tenant or multi-fund.** Scoping cases and audit logs to a
+  tenant is a straightforward extension; it was left out to keep the code
+  readable.
+
+## Where this would go next
+
+Short list of the changes a real v1 would need, roughly in order of leverage:
+
+1. **Real auth** via OIDC / your IdP, and a proper session layer — replaces
+   `middleware/auth.ts`.
+2. **Postgres** — change `provider` in `schema.prisma` and `DATABASE_URL`.
+   Migrations already exist.
+3. **File uploads for evidence** to object storage with hash-pinned references
+   on the audit entry (not just `recFilePath` strings).
+4. **More case types.** The domain model is already parameterized by
+   `CaseType`; adding, for example, `SUB_DOC_REVIEW`, `ALLOCATION_REVIEW`,
+   `VENDOR_ACCESS_GRANT` is additive. Each gets its own `rulesConfig`.
+5. **Scheduled workflows.** Auto-create the daily cash-rec case at
+   `businessDate 00:00` and attach bank + ledger feeds as inputs.
+6. **Notifications + SLA alerts.** Slack/email when a case is nearing `dueAt`,
+   and when a breach is recorded.
+7. **Database-level log immutability.** RLS + a trigger that prevents
+   `UPDATE`/`DELETE` on `audit_log`, plus a periodic Merkle root signed and
+   stored off-box.
+
+---
+
+Built as a demonstration piece. Questions welcome.
